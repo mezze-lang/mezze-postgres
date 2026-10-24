@@ -80,6 +80,58 @@ These run on **every** connection the pool opens. That is the right place for
 them, because a pooled connection is not the one you set a session variable on
 last time, and setting them per query would be two round trips instead of one.
 
+## Connection pooling — HikariCP
+
+```mezze
+use mezze_postgres::pool::{ PooledDb, open_pool, pool_defaults, close_pool }
+use std::polyglot::jvm::{ Jvm, JvmHost }
+
+perform JvmHost in match open_pool { config = pool_defaults { url = … } } is
+  Ok { val = ds } -> do
+    let r = perform PooledDb { ds = ds } in …   # ordinary Db, pooled by Hikari
+    close_pool { ds = ds }
+    r
+  Err { error = e } -> …
+```
+
+**Use this, not the runtime's own pool, for anything serving requests.** The
+runtime pools too — a semaphore, an idle deque and a reaper for connections
+whose thread died — and that is the right amount of machinery for SQLite, where
+a connection is a file handle. Over a network it is not enough. It has no:
+
+- **validation** — a pooled connection can be dead. Postgres closes idle ones; a
+  server restart kills every one at once. The runtime pool would hand you a dead
+  connection and let the query fail.
+- **max lifetime** — a connection that lives forever accumulates server-side
+  state, and anything behind a proxy wants them recycled.
+- **idle timeout** — a pool that only grows holds connections the server counts
+  against `max_connections`, a budget shared with every instance of your service.
+- **creation backoff** — a database that is down should not be hammered.
+
+HikariCP has all four in 170 KB of pure Java. `open_pool` builds one and hands
+it to the runtime as a `javax.sql.DataSource`; the scope then borrows rather
+than pools — `getConnection()` on lease, `close()` on release, which for a
+pooled connection returns it.
+
+**`close_pool` is yours to call.** A DataSource is a value you can perform with
+more than once, so leaving the scope does not shut it down.
+
+### Does going through Java cost anything?
+
+No, and it is measured. The DataSource crosses the host boundary **once**, when
+the scope opens; every `Db.run` afterwards is the same native it always was, so
+there is no interop per query and none per row.
+
+Over 400 queries against PostgreSQL 18.6: **39 ms** through the runtime's URL
+pool, **30 ms** through HikariCP via the foreign layer. The foreign route is not
+penalised — it is slightly faster, because Hikari reuses connections better than
+opening them on demand. If the boundary cost anything per query, 400 of them
+would have shown it.
+
+Sizing: `max_size` defaults to 10 with `min_idle` equal to it, i.e. a fixed
+pool, which is what Hikari recommends for a server. It is a **shared** resource —
+size it at the number of cores doing work, not hopefully.
+
 ## LISTEN / NOTIFY
 
 ```mezze

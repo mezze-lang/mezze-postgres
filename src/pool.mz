@@ -1,0 +1,145 @@
+# A real connection pool, for a database that is over a network.
+#
+# ## Why the runtime's own pool is not enough here
+#
+# `std::effects::db`'s scope pools: a semaphore, an idle deque, and a reaper for
+# connections whose thread died. That is the right amount of machinery for
+# SQLite, where a connection is a file handle and the failure modes are local.
+#
+# Over a network it is not. What it does not have:
+#
+#   - **validation.** A pooled connection can be dead — Postgres closes idle
+#     ones, a server restart kills every one at once, a network blip kills some.
+#     The runtime pool would hand you a dead connection and let the query fail.
+#   - **max lifetime.** A connection that lives forever accumulates server-side
+#     state, and a server behind a load balancer wants them recycled.
+#   - **idle timeout.** A pool that only ever grows holds connections a server
+#     counts against `max_connections` — a budget shared with every other
+#     instance of your service, 100 by default and some of those reserved.
+#   - **creation backoff.** A database that is down should not be hammered.
+#
+# ## So this uses HikariCP, and does not reimplement it
+#
+# HikariCP has all four, in 170 KB of pure Java that a large share of the JVM
+# world runs in production. `open_pool` builds one through
+# `std::polyglot::jvm` and hands it to the runtime as a `javax.sql.DataSource`.
+#
+# ## The host boundary is crossed ONCE
+#
+# This is the part worth being clear about, because reaching Java from Mezze is
+# normally something to do sparingly. The DataSource crosses when the scope
+# opens. After that `Db.run` and `Db.apply` are the same natives they always
+# were — the runtime calls `getConnection()` on lease and `close()` on release,
+# both in Java. There is no interop per query and none per row.
+#
+# The alternative — driving JDBC itself through the interop layer — would cost a
+# crossing per row per column, which is exactly why the `Db` effect does not
+# work that way.
+
+use mezze_postgres::postgres::{ pg_run, pg_apply, pg_tx }
+use std::polyglot::jvm::{ Jvm, JvmForeign, from_str, from_int }
+use std::effects::db::{ Db, DbError, Unavailable, Rejected }
+use std::int
+
+## How the pool behaves. Every field maps to the HikariCP setting of the same
+## name, so its documentation is the reference.
+pub type PoolConfig = {
+  url: Str,
+  ## The ceiling, and a SHARED resource: the server has a `max_connections` of
+  ## its own and every instance of your service spends from it. Hikari's own
+  ## advice is that a small pool with a queue beats a large one — a connection
+  ## waiting on a lock is not faster for having company.
+  max_size: Int,
+  ## Connections kept even when idle. Equal to `max_size` gives a fixed-size
+  ## pool, which is what Hikari recommends for a server.
+  min_idle: Int,
+  ## How long `getConnection()` waits before giving up, in ms.
+  connection_timeout_ms: Int,
+  ## How long an idle connection is kept, in ms. `0` disables.
+  idle_timeout_ms: Int,
+  ## The age at which a connection is retired, in ms. Keep it shorter than any
+  ## timeout the database or a proxy in front of it imposes, so the pool retires
+  ## a connection before something else kills it mid-query.
+  max_lifetime_ms: Int,
+  ## Run on every connection the pool opens, before it is handed out.
+  init_sql: Str,
+}
+
+## Sensible for a service: a fixed small pool, and a lifetime shorter than the
+## 30 minutes a default Postgres or pgbouncer is likely to allow.
+pub let pool_defaults: { url: Str } -> PoolConfig = { url } -> {
+  url = url,
+  max_size = 10,
+  min_idle = 10,
+  connection_timeout_ms = 30000,
+  idle_timeout_ms = 600000,
+  max_lifetime_ms = 1800000,
+  init_sql = "",
+}
+
+## Build a HikariCP pool and hand it to the runtime.
+##
+##     match open_pool { config = pool_defaults { url = … } } is
+##       Ok { val = ds } -> perform PooledDb { ds = ds } in …
+##       Err { error = e } -> …
+##
+## The returned `JvmForeign` IS the DataSource. It is a value, so it can be held
+## and passed around; the scope that performs with it owns its shutdown.
+pub let open_pool: { config: PoolConfig } -> Result JvmForeign DbError <Jvm> =
+  { config } -> do
+    let cfg = Jvm.class { name = "com.zaxxer.hikari.HikariConfig" }.new { args = [] }
+    let _ = cfg.method { name = "setJdbcUrl", args = [from_str { val = config.url }] }
+    let _ = cfg.method { name = "setMaximumPoolSize", args = [from_int { val = config.max_size }] }
+    let _ = cfg.method { name = "setMinimumIdle", args = [from_int { val = config.min_idle }] }
+    let _ = cfg.method { name = "setConnectionTimeout", args = [from_int { val = config.connection_timeout_ms }] }
+    let _ = cfg.method { name = "setIdleTimeout", args = [from_int { val = config.idle_timeout_ms }] }
+    let _ = cfg.method { name = "setMaxLifetime", args = [from_int { val = config.max_lifetime_ms }] }
+    ## Hikari validates with `Connection.isValid` when the driver supports it,
+    ## which PgJDBC does, so no test query is set here.
+    let withInit = if config.init_sql == ""
+      then cfg
+      else cfg.method { name = "setConnectionInitSql", args = [from_str { val = config.init_sql }] }
+    let ds = Jvm.class { name = "com.zaxxer.hikari.HikariDataSource" }.new { args = [withInit] }
+    match ds.is_null {} is
+      Err { error = _ } -> Err { error = Unavailable {
+        msg = "could not construct a HikariDataSource — is HikariCP on the classpath? Run `mez sync`.",
+      } }
+      Ok { val = True } -> Err { error = Unavailable { msg = "HikariCP returned no DataSource" } }
+      Ok { val = False } -> Ok { val = ds }
+
+## Shut the pool down, closing its connections and stopping its threads.
+##
+## THE SCOPE WILL NOT DO THIS FOR YOU, deliberately: a DataSource is a value you
+## can perform with more than once, and an earlier version had the scope close
+## it on exit — so the first `perform PooledDb` killed the pool and every query
+## in the second one failed. Whoever opened it closes it.
+pub let close_pool: { ds: JvmForeign } -> {} = { ds } -> do
+  let _ = ds.method { name = "close", args = [] }
+  {}
+
+## `Db` over a pool somebody else runs.
+##
+## The scope borrows from the DataSource rather than pooling itself:
+## `getConnection()` on lease, `close()` on release — which for a pooled
+## connection RETURNS it. Leaving the scope does NOT shut the pool down; call
+## `close_pool` when you are finished with it.
+impl Db for PooledDb { ds: JvmForeign } where {
+  initialize_scope = {} -> do
+    __native_db_open_datasource { ds = ds, init_sql = [] }
+    {},
+  finalize_scope = {} -> __native_db_scope_close {},
+
+  run   = { q } -> pg_run { q = q },
+  apply = { q } -> pg_apply { q = q },
+  tx    = { body } -> pg_tx { body = body },
+}
+
+
+## Diagnostic: hand the DataSource straight to the runtime and say what came
+## back. Not part of the intended surface — `perform PooledDb` is.
+pub let probe_open: { ds: JvmForeign } -> Str = { ds } ->
+  match __native_db_open_datasource { ds = ds, init_sql = [] } is
+    Ok { val = _ } -> "opened"
+    Err { error = Unavailable { msg = m } } -> "unavailable: $(m)"
+    Err { error = Rejected { sql = _, msg = m } } -> "rejected: $(m)"
+    Err { error = _ } -> "other error"

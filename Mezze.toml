@@ -17,3 +17,20 @@ path = "src/postgres.mz"
 # for the duration of a call; this does not.
 [maven]
 "org.postgresql:postgresql" = "42.7.4"
+
+# HikariCP, for `pool.mz`.
+#
+# The runtime has a pool of its own — a semaphore, an idle deque and a
+# dead-thread reaper — and it is right for SQLite, where a connection is a file
+# handle that does not spontaneously die. It has no connection VALIDATION, no
+# max lifetime, no idle timeout and no creation backoff, and every one of those
+# matters over a network: Postgres closes idle connections, a server restart
+# leaves every pooled connection dead, and the server's `max_connections` is a
+# budget shared with every other instance of your service.
+#
+# Writing those again would be writing HikariCP again, worse. It is 170 KB of
+# pure Java that a large share of the JVM world runs in production, so
+# `open_pool` builds one and hands it to the runtime as a `javax.sql.DataSource`.
+# The host boundary is crossed ONCE, when the scope opens; queries afterwards are
+# the same code they always were.
+"com.zaxxer:HikariCP" = "5.1.0"
