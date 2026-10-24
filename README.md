@@ -80,6 +80,62 @@ These run on **every** connection the pool opens. That is the right place for
 them, because a pooled connection is not the one you set a session variable on
 last time, and setting them per query would be two round trips instead of one.
 
+## LISTEN / NOTIFY
+
+```mezze
+use mezze_postgres::listen::{ open_listener, listen, wait_for, close_listener }
+use std::polyglot::jvm::{ Jvm, JvmHost }
+
+perform JvmHost in match open_listener { url = … } is
+  Ok { val = l } -> do
+    let _ = listen { l = l, channel = "jobs" }
+    match wait_for { l = l, timeout_ms = 5000 } is
+      Ok { val = ns } -> …   # [{ channel, payload, pid }]
+      Err { error = e } -> …
+  Err { error = e } -> …
+```
+
+**Not part of the `Db` effect, and not an oversight.** `Db`'s three operations
+are all request/response; a notification is the server pushing at you, which is
+a different shape. The pool is the other reason: `listen` is a property of ONE
+connection, and a pooled connection goes back the moment an operation finishes,
+so a subscription issued through `Db.apply` would sit on a connection nobody
+reads again and be silently lost. A listener holds a connection of its own for
+as long as it listens — which is exactly what a pool must not allow.
+
+Budget for it: one extra connection against the server's `max_connections` per
+listener, on top of the pool.
+
+**A listener is a value**, not an effect — `open_listener` hands back a record
+and every function takes it. Same choice `Query` makes.
+
+**Channel names are checked, not quoted.** A channel is an IDENTIFIER, so
+Postgres will not accept `listen $1` and the name has to be interpolated. That
+makes it the one place a caller's string reaches SQL as text, so anything but
+letters, digits and underscore is refused. Payloads are bound normally.
+
+`wait_for` BLOCKS on a socket read, which is the right thing under Loom: PgJDBC
+is pure Java, so a virtual thread waiting here unmounts and its carrier goes
+back to work. Spawn one task per listener and let it park. `poll` is the
+non-blocking form, but note that a notification only reaches the driver when it
+does I/O — a connection that never talks to the server may never see one.
+
+## Anything else PgJDBC can do
+
+The listener is not a special case; it is the pattern. It is written entirely in
+`std::polyglot::jvm` — host class lookup reaches `DriverManager`,
+`Connection.unwrap` reaches `PGConnection`, and `getNotifications()` is an
+ordinary method call. **Nothing was added to the Mezze runtime to make it
+possible.**
+
+So `CopyManager` for bulk loading, the large object API,
+`setPrepareThreshold` — anything the driver exposes is reachable the same way,
+by anyone, from a package. Copy `src/listen.mz` and follow it.
+
+The interop cost that rules this out for running QUERIES does not apply here: a
+result set is N rows by M columns of boundary crossings, where a notification
+poll is one call. Use the `Db` effect for queries and this for the rest.
+
 ## Known rough edges
 
 These are honest limitations, not oversights:

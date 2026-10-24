@@ -1,0 +1,219 @@
+# LISTEN / NOTIFY, and the pattern for every other PgJDBC-only feature.
+#
+# ## Why this is not part of the `Db` effect
+#
+# `Db` has three operations and all of them are request/response: ask, get an
+# answer. A notification is the server pushing something at you, which is a
+# different shape, and bending `run` into it would make the effect worse for the
+# 99% that only ever query.
+#
+# The POOL is the other reason. `listen mezze_chan` is a property of ONE
+# connection, and a pooled connection goes back the moment an operation
+# finishes — so a `LISTEN` issued through `Db.apply` would sit on a connection
+# nobody reads again, and the subscription would be silently lost. A listener
+# needs a connection of its own, for as long as it listens.
+#
+# ## How this works with no native and no runtime support
+#
+# Through `std::polyglot::jvm`: host class lookup reaches `DriverManager`,
+# `Connection.unwrap` reaches `PGConnection`, and `getNotifications()` is an
+# ordinary method call. Nothing in the Mezze runtime knows what a notification
+# is, and nothing had to be added for this to exist.
+#
+# THAT IS THE GENERAL ESCAPE HATCH. `CopyManager` for bulk loading, the large
+# object API, `setPrepareThreshold` — anything PgJDBC exposes is reachable the
+# same way, from a package, by anyone. The interop cost that rules this out for
+# running QUERIES does not apply: a result set is N rows by M columns of
+# boundary crossings, while a notification poll is one call.
+#
+# ## A listener is a VALUE
+#
+# No effect, no handler, no hidden state — `open_listener` hands back a record
+# holding the connection and every function takes it. That is the same choice
+# `Query` makes, and it means a listener can be passed around, held in a
+# record, or closed early without any of it being the effect system's business.
+
+use std::polyglot::jvm::{ Jvm, JvmForeign, from_str, from_int }
+use std::effects::db::{ DbError, Unavailable, Rejected }
+# `Jvm.class` rather than the free `class` helper. The helper calls the host
+# lookup native directly and so carries NO effect row — legitimate for
+# first-party stdlib, which is what its own comment says, but this is a PACKAGE.
+# Going through the ability op means `<Jvm>` shows up in these signatures and a
+# caller can see that this module reaches the host.
+#
+# Only partly, though, and that is worth knowing: the value verbs (`.method`,
+# `.str`, `.to_seq`) bury their own `perform Runtime in Polyglot.…`, so the work
+# they do is invisible to the row either way. The class lookups are the part
+# that shows.
+use std::collections::seq
+use std::str
+use std::char
+
+## One notification, as data.
+pub type PgNotification = {
+  ## The channel it arrived on — what `listen` was called with.
+  channel: Str,
+  ## The payload `notify … , 'payload'` carried, or `""` when it carried none.
+  ## Postgres sends an empty string rather than null for a payload-less notify.
+  payload: Str,
+  ## The backend process id that sent it. Useful for ignoring your own.
+  pid: Int,
+}
+
+## A dedicated connection that listens. Hold it for as long as you want
+## notifications; close it when you are done.
+pub type PgListener = {
+  conn: JvmForeign,
+}
+
+## Open a connection of this listener's own — NOT from the pool.
+##
+##   match open_listener { url = … } is
+##     Ok { val = l } -> do
+##       let _ = listen { l = l, channel = "jobs" }
+##       …
+##       close_listener { l = l }
+##     Err { error = e } -> …
+##
+## A listener holds its connection for its whole life, which is exactly what a
+## pool must not allow, so it does not take one from the pool. On a server that
+## means one extra connection against the server's `max_connections` budget per
+## listener — size the pool with that in mind.
+pub let open_listener: { url: Str } -> Result PgListener DbError <Jvm> = { url } -> do
+  let conn = Jvm.class { name = "java.sql.DriverManager" }
+    .method { name = "getConnection", args = [from_str { val = url }] }
+  match conn.is_null {} is
+    Err { error = _ } -> Err { error = Unavailable { msg = "could not open a listener connection for $(url)" } }
+    Ok { val = True } -> Err { error = Unavailable { msg = "the driver returned no connection for $(url)" } }
+    Ok { val = False } -> Ok { val = { conn = conn } }
+
+## Subscribe. Channel names are IDENTIFIERS, not values, so they cannot be
+## bound as parameters — `listen $1` is not valid Postgres. The name is
+## therefore interpolated, and that is the one place in this package where a
+## string reaches SQL as text, so it is checked: anything but letters, digits
+## and underscore is refused rather than quoted-and-hoped.
+pub let listen: { l: PgListener, channel: Str } -> Result {} DbError =
+  { l, channel } -> run_statement { l = l, sql = "listen $(channel)", channel = channel }
+
+## Unsubscribe.
+pub let unlisten: { l: PgListener, channel: Str } -> Result {} DbError =
+  { l, channel } -> run_statement { l = l, sql = "unlisten $(channel)", channel = channel }
+
+## Send one, on this listener's own connection.
+##
+## Mostly for tests — in a real system the thing that writes the row sends the
+## notification, usually from a trigger. The payload IS bound, because a payload
+## is a value.
+pub let notify: { l: PgListener, channel: Str, payload: Str } -> Result {} DbError =
+  { l, channel, payload } ->
+    if valid_channel { name = channel }
+      then do
+        let st = l.conn.method { name = "prepareStatement", args = [from_str { val = "select pg_notify('$(channel)', ?)" }] }
+        let _ = st.method { name = "setString", args = [from_int { val = 1 }, from_str { val = payload }] }
+        let r = st.method { name = "execute", args = [] }
+        let _ = st.method { name = "close", args = [] }
+        match r.is_null {} is
+          Err { error = _ } -> Err { error = Rejected { sql = "pg_notify", msg = "notify failed on channel $(channel)" } }
+          Ok { val = _ } -> Ok { val = {} }
+      else Err { error = bad_channel { name = channel } }
+
+## Everything that has arrived since the last call, and nothing blocks.
+##
+## `getNotifications()` returns what the driver has already read off the socket.
+## A notification only reaches the driver when it does I/O, so a listener that
+## never talks to the server may never see one — poll by sending something
+## cheap, or use the blocking form below.
+pub let poll: { l: PgListener } -> Result [PgNotification] DbError <Jvm> = { l } ->
+  collect { l = l, timeout_ms = 0 }
+
+## Wait up to `timeout_ms` for at least one, then take everything that arrived.
+##
+## `getNotifications(timeout)` BLOCKS the calling thread on a socket read. That
+## is the right thing under Loom: PgJDBC is pure Java and blocks on a SOCKET, so
+## a virtual thread waiting here unmounts and its carrier goes back to work.
+## Spawn one task per listener and let it park.
+pub let wait_for: { l: PgListener, timeout_ms: Int } -> Result [PgNotification] DbError <Jvm> =
+  { l, timeout_ms } -> collect { l = l, timeout_ms = timeout_ms }
+
+## Close the connection. A listener that is not closed holds its connection
+## until the process ends.
+pub let close_listener: { l: PgListener } -> {} = { l } -> do
+  let _ = l.conn.method { name = "close", args = [] }
+  {}
+
+## ── the parts nobody calls directly ────────────────────────────────────────
+
+## A channel name has to be an identifier. Refusing anything else is cheaper
+## than being clever: a name is not a value and cannot be bound, so the only
+## alternative to checking is interpolating whatever arrives.
+let valid_channel: { name: Str } -> Bool = { name } ->
+  if str::size { s = name } == 0 then False
+  else seq::all { xs = str::chars { s = name }, p = { x } -> is_ident_char { c = x } }
+
+let is_ident_char: { c: Char } -> Bool = { c } -> do
+  let t = char::to_str { c = c }
+  (t >= "a" && t <= "z") || (t >= "A" && t <= "Z") || (t >= "0" && t <= "9") || t == "_"
+
+let bad_channel: { name: Str } -> DbError = { name } -> Rejected {
+  sql = "listen",
+  msg = "a channel name must be letters, digits and underscore only — got '$(name)'. A channel is an IDENTIFIER, so it cannot be bound as a parameter, which is why it is checked instead.",
+}
+
+## Run one statement that takes no parameters, on this listener's connection.
+##
+## `listen` and `unlisten` both reach here, and both have the same problem: a
+## channel is an IDENTIFIER, and Postgres will not accept `listen $1`. So the
+## name is interpolated, which makes this the one place in this package where a
+## caller's string reaches SQL as text — hence the check, before anything else
+## happens.
+let run_statement: { l: PgListener, sql: Str, channel: Str } -> Result {} DbError =
+  { l, sql, channel } ->
+    if valid_channel { name = channel }
+      then do
+        let st = l.conn.method { name = "createStatement", args = [] }
+        let r = st.method { name = "execute", args = [from_str { val = sql }] }
+        let _ = st.method { name = "close", args = [] }
+        match r.is_null {} is
+          Err { error = _ } -> Err { error = Rejected { sql = sql, msg = "statement failed on this listener's connection" } }
+          Ok { val = _ } -> Ok { val = {} }
+      else Err { error = bad_channel { name = channel } }
+
+let collect: { l: PgListener, timeout_ms: Int } -> Result [PgNotification] DbError <Jvm> =
+  { l, timeout_ms } -> do
+    let pg = l.conn.method { name = "unwrap", args = [Jvm.class { name = "org.postgresql.PGConnection" }] }
+    let arr = if timeout_ms <= 0
+      then pg.method { name = "getNotifications", args = [] }
+      else pg.method { name = "getNotifications", args = [from_int { val = timeout_ms }] }
+    match arr.is_null {} is
+      Err { error = _ } -> Err { error = Unavailable { msg = "this listener's connection is not usable" } }
+      Ok { val = True } -> Ok { val = [] }
+      Ok { val = False } -> match arr.to_seq {} is
+        Err { error = _ } -> Err { error = Unavailable { msg = "could not read the notification array" } }
+        Ok { val = items } -> Ok { val = seq::filter_map { xs = items, f = { x } -> one_notification { n = x } } }
+
+## `None` for an entry whose CHANNEL will not read, because a notification
+## without its channel cannot be routed and is not worth handing on. The payload
+## and pid fall back instead: losing the payload of a message you were told about
+## is recoverable, losing the message is not.
+##
+## This is what `seq::filter_map` is for — one walk, and the holes never become
+## elements. The first draft of this made the mapper total and used `map`, which
+## is the wrong shape dressed up to fit a missing function.
+let one_notification: { n: JvmForeign } -> Option PgNotification = { n } ->
+  match n.method { name = "getName", args = [] }.str {} is
+    Err { error = _ } -> None
+    Ok { val = channel } -> Some { val = {
+      channel = channel,
+      payload = str_or { f = n.method { name = "getParameter", args = [] }, fallback = "" },
+      pid = int_or { f = n.method { name = "getPID", args = [] }, fallback = 0 },
+    } }
+
+let str_or: { f: JvmForeign, fallback: Str } -> Str = { f, fallback } ->
+  match f.str {} is
+    Ok { val = s } -> s
+    Err { error = _ } -> fallback
+
+let int_or: { f: JvmForeign, fallback: Int } -> Int = { f, fallback } ->
+  match f.int {} is
+    Ok { val = n } -> n
+    Err { error = _ } -> fallback

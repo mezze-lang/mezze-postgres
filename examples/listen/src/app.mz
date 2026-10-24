@@ -1,0 +1,25 @@
+use mezze_postgres::listen::{ PgListener, PgNotification, open_listener, listen, notify, poll, wait_for, close_listener }
+use std::polyglot::jvm::{ Jvm, JvmHost }
+use std::effects::log::{ Log, Console, println }
+use std::collections::seq
+use std::int
+
+let url = {} -> "jdbc:postgresql://127.0.0.1:55432/mezzetest?user=mezze"
+
+let main = {} -> perform Console in perform JvmHost in
+  match open_listener { url = url {} } is
+    Err { error = _ } -> println { msg = "open FAILED" }
+    Ok { val = l } -> do
+      let _ = listen { l = l, channel = "jobs" }
+      let _ = notify { l = l, channel = "jobs", payload = "job-42" }
+      match wait_for { l = l, timeout_ms = 2000 } is
+        Err { error = _ } -> println { msg = "wait FAILED" }
+        Ok { val = ns } -> do
+          println { msg = "got $(int::to_str { n = seq::size { xs = ns } }) notification(s)" }
+          match seq::get { xs = ns, i = 0 } is
+            None -> println { msg = "  (none)" }
+            Some { val = n } -> println { msg = "  channel=$(n.channel) payload=$(n.payload) pid>0=$(if n.pid > 0 then "yes" else "no")" }
+      match listen { l = l, channel = "bad; drop table users" } is
+        Err { error = _ } -> println { msg = "bad channel refused: yes" }
+        Ok { val = _ } -> println { msg = "bad channel refused: NO - INJECTION" }
+      close_listener { l = l }

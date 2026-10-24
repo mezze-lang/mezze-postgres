@@ -2,3 +2,5 @@
 .deps/
 .mez/
 Mezze.lock
+*.jar
+compiled-*.sqlite
