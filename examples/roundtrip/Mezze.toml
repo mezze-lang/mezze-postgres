@@ -11,6 +11,6 @@ entry = "main"
 # the released form instead:
 #
 #   [dependencies]
-#   mezze_postgres = "github:<owner>/mezze-postgres@v0.1.0"
+#   mezze_postgres = "github:mezze-lang/mezze-postgres@v0.1.0"
 [path-dependencies]
 mezze_postgres = "../.."

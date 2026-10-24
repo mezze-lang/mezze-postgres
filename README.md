@@ -19,7 +19,7 @@ let main = {} ->
 
 ```toml
 [dependencies]
-mezze_postgres = "github:<owner>/mezze-postgres@v0.1.0"
+mezze_postgres = "github:mezze-lang/mezze-postgres@v0.1.0"
 ```
 
 Then `mez sync`. That fetches this package and, through its `[maven]` block,
