@@ -1,0 +1,196 @@
+# PostgreSQL for Mezze — a `Db` performer, and nothing else.
+#
+# ## Why this is a package and not part of the stdlib
+#
+# `std::effects::db` owns the EFFECT: `Query`, `Rows`, `DbError`, the parameter
+# and row codecs, the mock performers. All of that is database-independent and
+# belongs with the language. What belongs out here is the part that knows about
+# one product.
+#
+# SQLite is the exception that stays in the stdlib, for the reason Python keeps
+# `sqlite3` in its own: an embedded database with no install step is the point,
+# and the driver is 5 MB of platform natives rather than a service to run.
+#
+# ## This package ships no natives, and could not
+#
+# Nothing here is privileged. Six of the runtime's seven `Db` natives never knew
+# which database they addressed — query, exec, begin, commit, rollback, close —
+# and `__native_db_open` takes any JDBC URL. So a driver is ordinary Mezze over
+# a maven coordinate, which is what lets a third party write one at all.
+#
+# ## Loom
+#
+# PgJDBC is pure Java and blocks on a SOCKET, so a virtual thread waiting for a
+# query unmounts and the carrier goes back to work. That is the difference from
+# the bundled SQLite driver, which is JNI and pins its carrier for the length of
+# a call. Pooling matters more here too: Postgres has real concurrent writers,
+# where SQLite has exactly one however many connections you open.
+
+use std::effects::db::{ Db, Query, Rows, DbError }
+use std::int
+use std::str
+use std::char
+use std::collections::seq
+
+## How a `Postgres` scope connects.
+pub type PgConfig = {
+  ## A JDBC URL: `jdbc:postgresql://host:port/database?user=…&password=…`.
+  ##
+  ## Build it with `pg_url` rather than by hand — it escapes what has to be
+  ## escaped, and a password assembled with string interpolation is how one ends
+  ## up in a log line.
+  url: Str,
+  ## How many connections the pool may hold. `0` lets the runtime choose.
+  ##
+  ## Unlike SQLite, Postgres writes concurrently, so this is a real throughput
+  ## knob rather than a read-only one. It is also a SHARED resource: the server
+  ## has a `max_connections` of its own (100 by default, and some of those are
+  ## reserved), so every instance of your service is spending from one budget.
+  ## Sizing this at the number of cores doing work beats sizing it hopefully —
+  ## a connection waiting on a lock is not faster for having company.
+  max_connections: Int,
+  ## Statements run on EVERY connection the pool opens, in order.
+  ##
+  ## This is where a session setting goes, because a pooled connection is not
+  ## the one you set it on last time: `set search_path`, `set time zone`,
+  ## `set statement_timeout`. Setting them per query would be two round trips
+  ## instead of one; setting them here makes them a property of the pool.
+  init_sql: [Str],
+}
+
+## A URL from its parts, with the characters that have to be escaped escaped.
+##
+##   pg_url { host = "db.internal", port = 5432, database = "app",
+##            user = "svc", password = "s3cr3t" }
+##
+## `password = ""` leaves the parameter off entirely rather than sending an
+## empty one, which is what a trust or peer-authenticated local server wants.
+pub let pg_url: { host: Str, port: Int, database: Str, user: Str, password: Str } -> Str =
+  { host, port, database, user, password } -> do
+    let base = "jdbc:postgresql://$(host):$(int::to_str { n = port })/$(database)"
+    let with_user = "$(base)?user=$(url_escape { s = user })"
+    if password == ""
+      then with_user
+      else "$(with_user)&password=$(url_escape { s = password })"
+
+## Percent-escape the characters that would otherwise end a URL parameter.
+##
+## Deliberately a SMALL set — `&`, `=`, `%`, `+`, `#`, `?`, and space — rather
+## than a general URL encoder. These are the ones that change what the URL
+## MEANS, so getting them wrong sends half a password as a different parameter.
+## Anything else is passed through, because a Postgres password is bytes and
+## mangling a legitimate one is its own bug.
+let url_escape: { s: Str } -> Str = { s } ->
+  seq::fold {
+    xs = str::chars { s = s },
+    init = "",
+    f = { acc, x } -> "$(acc)$(escape_char { c = x })",
+  }
+
+## A `Char` compared as a one-character `Str`: the comparison is against literal
+## text, and `char::to_str` is how a Char becomes that.
+let escape_char: { c: Char } -> Str = { c } -> do
+  let t = char::to_str { c = c }
+  if t == "%" then "%25"
+  else if t == "&" then "%26"
+  else if t == "=" then "%3D"
+  else if t == "+" then "%2B"
+  else if t == "#" then "%23"
+  else if t == "?" then "%3F"
+  else if t == " " then "%20"
+  else t
+
+## A config with the defaults: runtime-chosen pool size, no session settings.
+pub let pg_config: { url: Str } -> PgConfig = { url } ->
+  { url = url, max_connections = 0, init_sql = [] }
+
+## ── The three operations, once ──────────────────────────────────────────────
+##
+## Extracted so the two performers share them. They differ only in how they
+## CONNECT, and a second copy of `tx` is the last thing a driver needs.
+
+let pg_run: { q: Query } -> Result Rows DbError = { q } ->
+  __native_db_query { sql = q.sql, params = q.params }
+
+let pg_apply: { q: Query } -> Result { changed: Int } DbError = { q } ->
+  __native_db_exec { sql = q.sql, params = q.params }
+
+## Begin, run, then commit or roll back.
+##
+## A nested `tx` JOINS the enclosing one rather than opening a SAVEPOINT. The
+## promise a transaction makes is that its body commits together or not at all,
+## and an inner transaction that could roll back on its own would leave the
+## outer one half applied. So the inner `tx` neither commits nor rolls back —
+## `began.nested` says it began nothing — and the outer one decides for both.
+##
+## A body that fails rolls back, and the BODY's error is what comes out. A
+## rollback that itself fails is not reported, because it would replace the
+## reason the transaction was abandoned with a fact about the abandoning.
+##
+## WORK FORKED INSIDE THE BODY runs on another thread, takes another connection
+## from the pool, and therefore does NOT see this transaction's uncommitted
+## writes. That is what a transaction being a property of a CONNECTION means,
+## and it is what every pool-based framework does; it is still not what someone
+## writing it expects. Keep a transaction's work on its own thread.
+let pg_tx: { body: {} -> Result 'a DbError <...> } -> Result 'a DbError <...> =
+  { body } -> match __native_db_begin {} is
+    Err { error = e } -> Err { error = e }
+    Ok { val = began } -> match body {} is
+      Err { error = e } -> do
+        if began.nested then {} else __native_db_rollback {}
+        Err { error = e }
+      Ok { val = v } ->
+        if began.nested then Ok { val = v }
+        else match __native_db_commit {} is
+          Err { error = e } -> Err { error = e }
+          Ok { val = _ } -> Ok { val = v }
+
+## ── The performers ──────────────────────────────────────────────────────────
+
+## Connect for the scope of the `perform`.
+##
+##   use mezze_postgres::postgres::{ Postgres, pg_config, pg_url }
+##   use std::effects::db::{ Db, sql, BindParams, value_at }
+##
+##   let main = {} ->
+##     perform Postgres { config = pg_config {
+##       url = pg_url { host = "127.0.0.1", port = 5432, database = "app",
+##                      user = "svc", password = "" },
+##     } } in
+##       Db.run { q = sql { text = "select name from users where id = :id" }
+##                  .bind { params = { id = 7 } } }
+##
+## A URL that cannot be reached makes every operation in the scope answer
+## `Unavailable` with the server's own reason. `initialize_scope` has nowhere to
+## put a failure — it answers `{}` — so rather than crash the program at
+## `perform`, the scope opens poisoned and the first operation says why. If the
+## reason is `No suitable driver`, this package's jar is not on the classpath:
+## run `mez sync`.
+impl Db for Postgres { config: PgConfig } where {
+  initialize_scope = {} -> do
+    __native_db_open {
+      url = config.url,
+      max_connections = config.max_connections,
+      init_sql = config.init_sql,
+    }
+    {},
+  finalize_scope = {} -> __native_db_scope_close {},
+
+  run   = { q } -> pg_run { q = q },
+  apply = { q } -> pg_apply { q = q },
+  tx    = { body } -> pg_tx { body = body },
+}
+
+## `Postgres` for a URL you already have, with the defaults.
+##
+##   perform PostgresAt { url = "jdbc:postgresql://localhost:5432/app?user=me" } in …
+impl Db for PostgresAt { url: Str } where {
+  initialize_scope = {} -> do
+    __native_db_open { url = url, max_connections = 0, init_sql = [] }
+    {},
+  finalize_scope = {} -> __native_db_scope_close {},
+
+  run   = { q } -> pg_run { q = q },
+  apply = { q } -> pg_apply { q = q },
+  tx    = { body } -> pg_tx { body = body },
+}

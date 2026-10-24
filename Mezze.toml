@@ -1,0 +1,19 @@
+[package]
+name = "mezze_postgres"
+version = "0.1.0"
+
+[lib]
+path = "src/postgres.mz"
+
+# The driver, and the only reason this package needs a jar at all.
+#
+# `java.sql` is the JDK's API and ships with it; a DRIVER does not, and the
+# Mezze runtime deliberately bundles none except SQLite's. PgJDBC is pure Java —
+# no native library, no toolchain — so it is an ordinary maven coordinate and
+# `mez sync` puts it on the classpath.
+#
+# Pure Java also matters for Loom: PgJDBC blocks on a SOCKET, so a virtual
+# thread waiting on a query UNMOUNTS. sqlite-jdbc is JNI and pins its carrier
+# for the duration of a call; this does not.
+[maven]
+"org.postgresql:postgresql" = "42.7.4"

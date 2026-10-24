@@ -1,0 +1,24 @@
+use mezze_postgres::postgres::{ Postgres, PgConfig, pg_config, pg_url }
+use std::effects::db::{ Db, DbValue, DbInt, DbStr, sql, BindParams, value_at, row_count }
+use std::effects::log::{ Log, Console, println }
+use std::int
+
+let roundtrip: {} -> Str <Db> = {} -> do
+  let _ = Db.apply { q = sql { text = "drop table if exists pkg_t" } }
+  let _ = Db.apply { q = sql { text = "create table pkg_t (id int, name text)" } }
+  let _ = Db.apply { q = sql { text = "insert into pkg_t (id, name) values (:id, :name)" }
+           .bind { params = { id = 1, name = "from-the-package" } } }
+  match Db.run { q = sql { text = "select name from pkg_t where id = :id" }
+         .bind { params = { id = 1 } } } is
+    Ok { val = rows } -> match value_at { rows = rows, row = 0, col = 0 } is
+      Some { val = DbStr { val = n } } -> n
+      Some { val = _ } -> "wrong type"
+      None -> "no rows"
+    Err { error = _ } -> "db error"
+
+let main = {} -> perform Console in
+  perform Postgres { config = pg_config {
+    url = "jdbc:postgresql://127.0.0.1:55432/mezzetest?user=mezze",
+  } } in do
+    println { msg = "select answered: $(roundtrip {})" }
+    println { msg = "pg_url builds: $(pg_url { host = "h", port = 5432, database = "d", user = "u", password = "p&p=x" })" }

@@ -1,0 +1,16 @@
+[package]
+name = "roundtrip"
+version = "0.1.0"
+
+[[app]]
+name = "roundtrip"
+path = "src/app.mz"
+entry = "main"
+
+# While developing the package itself, point at it on disk. A consumer writes
+# the released form instead:
+#
+#   [dependencies]
+#   mezze_postgres = "github:<owner>/mezze-postgres@v0.1.0"
+[path-dependencies]
+mezze_postgres = "../.."
