@@ -96,6 +96,13 @@ These are honest limitations, not oversights:
 - **Work forked inside a transaction gets a different connection** and so does
   not see that transaction's uncommitted writes. Keep a transaction's work on
   its own thread.
+- **A bare `?` is ambiguous and stays a placeholder.** On Postgres `?` is also
+  jsonb's key-existence operator, and nothing lexical tells them apart. Write
+  `??` for the operator — it emits one literal `?` and binds nothing, which is
+  PgJDBC's own convention — or use `jsonb_exists(data, 'k')`. `?|` and `?&`
+  need no escape; they are recognised as operators.
+- **`arr[:lo]` reads as a placeholder, not an array slice.** Numeric bounds
+  (`arr[1:3]`) are left alone.
 - **Cancellation does not reach the server.** A cancelled Mezze task leaves its
   query running to completion; `Statement.cancel` is not wired up.
 
