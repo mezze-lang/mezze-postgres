@@ -14,10 +14,14 @@
 # ## This package ships no natives, and could not
 #
 # Nothing here is privileged, and after the stdlib grew wrappers this package
-# calls NO native at all: `open_url`, `close_scope`, `native_run`,
-# `native_apply`, `native_apply_batch`, `native_describe` and the three
+# calls NO native at all: `open_url`, `close_scope`, `scope_run`,
+# `scope_apply`, `scope_apply_batch`, `scope_describe` and the three
 # transaction steps are all `pub` in `std::effects::db`. A driver is ordinary
 # Mezze over a maven coordinate, which is what lets a third party write one.
+#
+# The surface it uses is `open_*` / `close_scope` to manage the scope and
+# `scope_*` to run inside it — named for the scope rather than for being
+# natives, because which of them is a native is not a driver's business.
 #
 # The thing that made it possible is that `open_url` takes ANY JDBC URL — the
 # other operations never knew which database they addressed.
@@ -31,8 +35,8 @@
 # where SQLite has exactly one however many connections you open.
 
 use std::effects::db::{ Db, Query, Rows, DbError, StatementInfo, Batch,
-                        native_run, native_apply, native_apply_batch, native_describe,
-                        native_begin, native_commit, native_rollback, open_url, close_scope }
+                        scope_run, scope_apply, scope_apply_batch, scope_describe,
+                        scope_begin, scope_commit, scope_rollback, open_url, close_scope }
 use std::int
 use std::str
 use std::char
@@ -119,16 +123,16 @@ pub let pg_config: { url: Str } -> PgConfig = { url } ->
 ## differently again — through a `javax.sql.DataSource` — and needs the same
 ## three bodies. Not part of the package's intended surface: use a performer.
 
-pub let pg_run: { q: Query } -> Result Rows DbError = { q } -> native_run { q = q }
+pub let pg_run: { q: Query } -> Result Rows DbError = { q } -> scope_run { q = q }
 
 pub let pg_apply: { q: Query } -> Result { changed: Int } DbError = { q } ->
-  native_apply { q = q }
+  scope_apply { q = q }
 
 pub let pg_apply_batch: { b: Batch } -> Result { changed: Int } DbError = { b } ->
-  native_apply_batch { b = b }
+  scope_apply_batch { b = b }
 
 pub let pg_describe: { q: Query } -> Result StatementInfo DbError = { q } ->
-  native_describe { q = q }
+  scope_describe { q = q }
 
 ## Begin, run, then commit or roll back.
 ##
@@ -148,15 +152,15 @@ pub let pg_describe: { q: Query } -> Result StatementInfo DbError = { q } ->
 ## and it is what every pool-based framework does; it is still not what someone
 ## writing it expects. Keep a transaction's work on its own thread.
 pub let pg_tx: { body: {} -> Result 'a DbError <...> } -> Result 'a DbError <...> =
-  { body } -> match native_begin {} is
+  { body } -> match scope_begin {} is
     Err { error = e } -> Err { error = e }
     Ok { val = began } -> match body {} is
       Err { error = e } -> do
-        if began.nested then {} else native_rollback {}
+        if began.nested then {} else scope_rollback {}
         Err { error = e }
       Ok { val = v } ->
         if began.nested then Ok { val = v }
-        else match native_commit {} is
+        else match scope_commit {} is
           Err { error = e } -> Err { error = e }
           Ok { val = _ } -> Ok { val = v }
 
