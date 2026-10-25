@@ -195,9 +195,12 @@ These are honest limitations, not oversights:
 - **A `uuid`, `timestamptz` or `jsonb` column arrives as text.** `DbValue` has
   cases for integers, floats, strings, booleans and bytes; anything else falls
   through to its string form. Usable, but you parse it yourself.
-- **`NUMERIC` arrives as `DbFloat`, which is lossy.** Postgres `NUMERIC` is
-  exact and a double is not. For money, bind and read an `Int` of minor units,
-  or read the column as text with `::text` and parse it.
+- ~~`NUMERIC` arrives as `DbFloat`, which is lossy.~~ **Fixed.** It arrives as
+  `DbDecimal`, carrying the exact digits as text. Verified: a
+  `numeric(30,2)` holding `12345678901234567890.12` round-trips unchanged.
+  Decode it as `Frac` to keep it exact (`frac::from_decimal_str` parses it),
+  as `Str` to keep the digits, or as `Float` if you genuinely want the
+  narrowing.
 - **Placeholder names are checked when the statement runs, not when it
   compiles.** A `:nmae` against a record holding `name` is a `Rejected` error
   that names the placeholder — caught, but at run time.

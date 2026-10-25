@@ -38,7 +38,7 @@
 
 use mezze_postgres::postgres::{ pg_run, pg_apply, pg_apply_batch, pg_describe, pg_tx }
 use std::polyglot::jvm::{ Jvm, JvmForeign, from_str, from_int }
-use std::effects::db::{ Db, DbError, Unavailable, Rejected, open_datasource, close_scope }
+use std::effects::db::{ Db, DbError, Unavailable, Rejected, driver_open_datasource, driver_close }
 use std::int
 
 ## How the pool behaves. Every field maps to the HikariCP setting of the same
@@ -125,9 +125,9 @@ pub let close_pool: { ds: JvmForeign } -> {} = { ds } -> do
 ## `close_pool` when you are finished with it.
 impl Db for PooledDb { ds: JvmForeign } where {
   initialize_scope = {} -> do
-    open_datasource { ds = ds, init_sql = [] }
+    driver_open_datasource { ds = ds, init_sql = [] }
     {},
-  finalize_scope = {} -> close_scope {},
+  finalize_scope = {} -> driver_close {},
 
   run   = { q } -> pg_run { q = q },
   apply = { q } -> pg_apply { q = q },
@@ -140,7 +140,7 @@ impl Db for PooledDb { ds: JvmForeign } where {
 ## Diagnostic: hand the DataSource straight to the runtime and say what came
 ## back. Not part of the intended surface — `perform PooledDb` is.
 pub let probe_open: { ds: JvmForeign } -> Str = { ds } ->
-  match open_datasource { ds = ds, init_sql = [] } is
+  match driver_open_datasource { ds = ds, init_sql = [] } is
     Ok { val = _ } -> "opened"
     Err { error = Unavailable { msg = m } } -> "unavailable: $(m)"
     Err { error = Rejected { sql = _, msg = m } } -> "rejected: $(m)"
